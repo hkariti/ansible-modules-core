@@ -74,6 +74,11 @@ options:
       - snapshot id to remove
     required: false
     version_added: "1.9"
+  snapshot_max_age:
+    description:
+      - If the volume's most recent snapshot has started less than `snapshot_max_age' minutes ago, a new snapshot will not be created.
+    required: false
+    default: 0
 
 author: Will Thames
 extends_documentation_fragment: aws
@@ -124,8 +129,9 @@ def main():
             instance_id = dict(),
             snapshot_id = dict(),
             device_name = dict(),
-            wait = dict(type='bool', default='true'),
-            wait_timeout = dict(default=0),
+            wait = dict(type='bool', default='false'),
+            wait_timeout = dict(type='int', default=0),
+            snapshot_max_age = dict(type='int', default=0),
             snapshot_tags = dict(type='dict', default=dict()),
             state = dict(choices=['absent','present'], default='present'),
         )
@@ -139,8 +145,12 @@ def main():
     device_name = module.params.get('device_name')
     wait = module.params.get('wait')
     wait_timeout = module.params.get('wait_timeout')
+    snapshot_max_age = module.params.get('snapshot_max_age')
     snapshot_tags = module.params.get('snapshot_tags')
     state = module.params.get('state')
+
+    snapshot = None
+    changed = False
 
     if not volume_id and not instance_id and not snapshot_id or volume_id and instance_id and snapshot_id:
         module.fail_json('One and only one of volume_id or instance_id or snapshot_id must be specified')
@@ -172,10 +182,37 @@ def main():
             else:
                 module.fail_json(msg = "%s: %s" % (e.error_code, e.error_message))
 
+    if snapshot_max_age > 0:
+        try:
+            snapshot_max_age = snapshot_max_age * 60 # Convert to seconds
+            current_snapshots = ec2.get_all_snapshots(filters={'volume_id': volume_id})
+            # Find the most recent snapshot
+            recent = dict(start_time=0, snapshot=None)
+            for s in current_snapshots:
+                start_time = time.mktime(time.strptime(s.start_time, '%Y-%m-%dT%H:%M:%S.000Z'))
+                if start_time > recent['start_time']:
+                    recent['start_time'] = start_time
+                    recent['snapshot'] = s
+
+            # Adjust snapshot start time to local timezone
+            tz_adjustment = time.daylight and time.altzone or time.timezone
+            recent['start_time'] -= tz_adjustment
+
+            # See if the snapshot is younger that the given max age
+            current_time = time.mktime(time.localtime())
+            snapshot_age = current_time - recent['start_time']
+            if snapshot_age < snapshot_max_age:
+                snapshot = recent['snapshot']
+        except boto.exception.BotoServerError, e:
+            module.fail_json(msg="%s: %s" % (e.error_code, e.error_message))
+
     try:
-        snapshot = ec2.create_snapshot(volume_id, description=description)
-        time_waited = 0
+        # Create a new snapshot if we didn't find an existing one to use
+        if snapshot is None:
+            snapshot = ec2.create_snapshot(volume_id, description=description)
+            changed = True
         if wait:
+            time_waited = 0
             snapshot.update()
             while snapshot.status != 'completed':
                 time.sleep(3)
@@ -186,9 +223,9 @@ def main():
         for k, v in snapshot_tags.items():
             snapshot.add_tag(k, v)
     except boto.exception.BotoServerError, e:
-        module.fail_json(msg = "%s: %s" % (e.error_code, e.error_message))
+        module.fail_json(msg="%s: %s" % (e.error_code, e.error_message))
 
-    module.exit_json(changed=True, snapshot_id=snapshot.id, volume_id=snapshot.volume_id,
+    module.exit_json(changed=changed, snapshot_id=snapshot.id, volume_id=snapshot.volume_id,
             volume_size=snapshot.volume_size, tags=snapshot.tags.copy())
 
 # import module snippets
